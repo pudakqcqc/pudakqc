@@ -1,0 +1,405 @@
+import sys
+import os
+import time
+from datetime import datetime
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMutex, QWaitCondition
+from PyQt6.QtGui import QImage, QPixmap, QFont
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QVBoxLayout, 
+    QHBoxLayout, QFrame, QTableWidget, QTableWidgetItem, QHeaderView,
+    QSlider, QGroupBox, QGridLayout, QComboBox
+)
+
+# Warna Tampilan Bounding Box per Defect
+CLASS_COLORS = {
+    'part_a': (255, 255, 0),              # Cyan (Produk Utama)
+    'shortshot': (0, 165, 255),           # Orange
+    'black_spot': (0, 0, 255),            # Merah
+    'color_contamination': (255, 0, 255), # Magenta
+    'scratch': (0, 255, 255),             # Kuning
+    'surface': (255, 105, 180)            # Pink
+}
+
+
+class FastUltralyticsPredictor:
+    """Predictor Cepat & Akurat Menggunakan Engine Ultralytics YOLO"""
+    def __init__(self, model_path="best.onnx", conf_thres=0.25, iou_thres=0.45, img_size=640):
+        self.conf_thres = conf_thres
+        self.iou_thres = iou_thres
+        self.img_size = img_size
+        
+        try:
+            # Bisa membaca file .onnx maupun .pt secara otomatis
+            self.model = YOLO(model_path, task='detect')
+            self.model_loaded = True
+            print("[INFO] Model Berhasil Dimuat via Engine Ultralytics!")
+            print(f"[INFO] Kelas terdeteksi dari model: {self.model.names}")
+        except Exception as e:
+            print(f"[ERROR] Gagal memuat model: {e}")
+            self.model_loaded = False
+
+    def predict(self, frame):
+        if not self.model_loaded or frame is None:
+            return []
+
+        # Jalankan prediksi dengan parameter threshold
+        results = self.model.predict(
+            source=frame,
+            conf=self.conf_thres,
+            iou=self.iou_thres,
+            imgsz=self.img_size,
+            verbose=False
+        )
+
+        detections = []
+        if len(results) > 0 and len(results[0].boxes) > 0:
+            boxes = results[0].boxes
+            for box in boxes:
+                # Koordinat [x1, y1, x2, y2]
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                w = x2 - x1
+                h = y2 - y1
+                
+                conf = float(box.conf[0].cpu().numpy())
+                cls_id = int(box.cls[0].cpu().numpy())
+                
+                # Mengambil nama label langsung dari metadata model (100% Akurat)
+                label_name = self.model.names.get(cls_id, f"cls_{cls_id}")
+
+                detections.append({
+                    'box': [x1, y1, w, h],
+                    'confidence': conf,
+                    'class_id': cls_id,
+                    'label': label_name
+                })
+
+        return detections
+
+
+class InferenceThread(QThread):
+    """Thread Latar Belakang AI"""
+    detections_ready = pyqtSignal(list)
+
+    def __init__(self, predictor):
+        super().__init__()
+        self.predictor = predictor
+        self.running = True
+        self.latest_frame = None
+        self.mutex = QMutex()
+        self.condition = QWaitCondition()
+
+    def set_frame(self, frame):
+        self.mutex.lock()
+        self.latest_frame = frame.copy()
+        self.condition.wakeOne()
+        self.mutex.unlock()
+
+    def run(self):
+        while self.running:
+            self.mutex.lock()
+            if self.latest_frame is None:
+                self.condition.wait(self.mutex)
+            
+            frame_to_process = self.latest_frame
+            self.latest_frame = None
+            self.mutex.unlock()
+
+            if frame_to_process is not None and self.predictor:
+                results = self.predictor.predict(frame_to_process)
+                self.detections_ready.emit(results)
+            
+            time.sleep(0.01)
+
+    def stop(self):
+        self.running = False
+        self.mutex.lock()
+        self.condition.wakeOne()
+        self.mutex.unlock()
+        self.wait()
+
+
+class CameraThread(QThread):
+    """Thread Stream Kamera Real-time"""
+    new_frame = pyqtSignal(np.ndarray, float)
+
+    def __init__(self, camera_index=0, flip_camera=False):
+        super().__init__()
+        self.camera_index = camera_index
+        self.flip_camera = flip_camera
+        self.running = True
+
+    def run(self):
+        cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW) if sys.platform.startswith('win') else cv2.VideoCapture(self.camera_index)
+        
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+
+        prev_time = time.time()
+
+        while self.running and cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.01)
+                continue
+
+            if self.flip_camera:
+                frame = cv2.flip(frame, 1)
+
+            curr_time = time.time()
+            fps = 1.0 / (curr_time - prev_time + 1e-6)
+            prev_time = curr_time
+
+            self.new_frame.emit(frame, fps)
+            time.sleep(0.01)
+
+        cap.release()
+
+    def stop(self):
+        self.running = False
+        self.wait()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Visual Sensor QC - Laptop Test")
+        self.setGeometry(50, 50, 1280, 760)
+        self.setStyleSheet("background-color: #0f172a; color: #f8fafc;")
+
+        self.total_scanned = 0
+        self.pass_count = 0
+        self.defect_count = 0
+        self.last_state = None
+        self.part_counter = 1
+        self.latest_detections = []
+
+        self.init_ui()
+
+        # Load Predictor Ultralytics (Bisa menggunakan best.onnx atau best.pt)
+        self.predictor = FastUltralyticsPredictor(model_path="best.onnx", conf_thres=0.25)
+        
+        self.infer_thread = InferenceThread(self.predictor)
+        self.infer_thread.detections_ready.connect(self.on_detections_ready)
+        self.infer_thread.start()
+
+        self.camera_thread = CameraThread(camera_index=0, flip_camera=False)
+        self.camera_thread.new_frame.connect(self.on_new_frame)
+        self.camera_thread.start()
+
+    def init_ui(self):
+        main_layout = QHBoxLayout()
+
+        left_layout = QVBoxLayout()
+        header_frame = QFrame()
+        header_frame.setStyleSheet("background-color: #1e293b; border-radius: 8px; padding: 10px;")
+        header_box = QHBoxLayout(header_frame)
+        
+        title = QLabel("PRODUCT INSPECTION: part_a")
+        title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        title.setStyleSheet("color: #38bdf8;")
+        
+        self.fps_label = QLabel("FPS: --")
+        self.fps_label.setStyleSheet("color: #a855f7; font-weight: bold;")
+
+        header_box.addWidget(title)
+        header_box.addStretch()
+        header_box.addWidget(self.fps_label)
+        left_layout.addWidget(header_frame)
+
+        self.video_label = QLabel("Membuka Kamera...")
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label.setMinimumSize(640, 480)
+        self.video_label.setStyleSheet("background-color: #000; border: 2px solid #334155; border-radius: 8px;")
+        left_layout.addWidget(self.video_label)
+
+        controls_group = QGroupBox("Pengaturan Kamera & Threshold")
+        controls_group.setStyleSheet("color: #94a3b8; font-weight: bold; border: 1px solid #334155; padding: 10px;")
+        controls_layout = QGridLayout(controls_group)
+        
+        controls_layout.addWidget(QLabel("Pilih Kamera:"), 0, 0)
+        self.cam_combo = QComboBox()
+        self.cam_combo.addItems(["Kamera Depan / Utama (Index 0)", "Kamera Eksternal (Index 1)", "Kamera Eksternal (Index 2)"])
+        self.cam_combo.setStyleSheet("background-color: #0f172a; color: #38bdf8; padding: 5px; border-radius: 4px;")
+        self.cam_combo.currentIndexChanged.connect(self.change_camera)
+        controls_layout.addWidget(self.cam_combo, 0, 1)
+
+        controls_layout.addWidget(QLabel("Confidence Threshold:"), 1, 0)
+        self.conf_slider = QSlider(Qt.Orientation.Horizontal)
+        self.conf_slider.setRange(5, 95)
+        self.conf_slider.setValue(25)  # Set default ke 0.25 agar defect kecil seperti shortshot lebih mudah kedeteksi
+        self.conf_slider.valueChanged.connect(self.update_confidence)
+        
+        self.conf_value_label = QLabel("0.25")
+        self.conf_value_label.setStyleSheet("color: #38bdf8;")
+
+        controls_layout.addWidget(self.conf_slider, 1, 1)
+        controls_layout.addWidget(self.conf_value_label, 1, 2)
+        
+        left_layout.addWidget(controls_group)
+        main_layout.addLayout(left_layout, stretch=2)
+
+        right_layout = QVBoxLayout()
+        self.status_badge = QLabel("WAITING FOR PRODUCT (part_a)")
+        self.status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_badge.setFont(QFont("Arial", 16, QFont.Weight.Bold))
+        self.status_badge.setStyleSheet("background-color: #334155; color: #94a3b8; padding: 15px; border-radius: 8px;")
+        right_layout.addWidget(self.status_badge)
+
+        kpi_grid = QGridLayout()
+        self.card_total = self.create_card("Total Scan", "0", "#38bdf8")
+        self.card_pass = self.create_card("PASS (OK)", "0", "#22c55e")
+        self.card_defect = self.create_card("DEFECT (NG)", "0", "#ef4444")
+        self.card_yield = self.create_card("Yield Rate", "100%", "#a855f7")
+
+        kpi_grid.addWidget(self.card_total, 0, 0)
+        kpi_grid.addWidget(self.card_pass, 0, 1)
+        kpi_grid.addWidget(self.card_defect, 1, 0)
+        kpi_grid.addWidget(self.card_yield, 1, 1)
+        right_layout.addLayout(kpi_grid)
+
+        log_title = QLabel("Inspection History Log")
+        log_title.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        log_title.setStyleSheet("color: #94a3b8; margin-top: 10px;")
+        right_layout.addWidget(log_title)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Timestamp", "Part ID", "Status", "Defects Detected"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.setStyleSheet("""
+            QTableWidget { background-color: #1e293b; color: #f8fafc; gridline-color: #334155; border-radius: 6px; }
+            QHeaderView::section { background-color: #0f172a; color: #94a3b8; font-weight: bold; border: none; padding: 5px; }
+        """)
+        right_layout.addWidget(self.table)
+
+        main_layout.addLayout(right_layout, stretch=1)
+
+        container = QWidget()
+        container.setLayout(main_layout)
+        self.setCentralWidget(container)
+
+    def create_card(self, title, default_val, color_hex):
+        frame = QFrame()
+        frame.setStyleSheet(f"background-color: #1e293b; border-left: 4px solid {color_hex}; border-radius: 6px; padding: 8px;")
+        layout = QVBoxLayout(frame)
+        lbl_title = QLabel(title)
+        lbl_title.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        lbl_val = QLabel(default_val)
+        lbl_val.setFont(QFont("Arial", 16, QFont.Weight.Bold))
+        lbl_val.setStyleSheet(f"color: {color_hex};")
+        layout.addWidget(lbl_title)
+        layout.addWidget(lbl_val)
+        frame.val_label = lbl_val
+        return frame
+
+    def change_camera(self, index):
+        self.camera_thread.stop()
+        self.camera_thread = CameraThread(camera_index=index, flip_camera=False)
+        self.camera_thread.new_frame.connect(self.on_new_frame)
+        self.camera_thread.start()
+
+    def update_confidence(self, value):
+        conf = value / 100.0
+        self.conf_value_label.setText(f"{conf:.2f}")
+        self.predictor.conf_thres = conf
+
+    def on_new_frame(self, frame, fps):
+        self.fps_label.setText(f"FPS: {fps:.1f}")
+
+        self.infer_thread.set_frame(frame)
+
+        detections = self.latest_detections
+        part_detected = any(d['label'] == 'part_a' for d in detections)
+        defects = [d for d in detections if d['label'] != 'part_a']
+        has_defect = len(defects) > 0
+
+        for det in detections:
+            x, y, w, h = det['box']
+            label = det['label']
+            conf = det['confidence']
+
+            color = CLASS_COLORS.get(label, (0, 255, 0))
+
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+            text = f"{label} {conf:.2f}"
+            cv2.putText(frame, text, (x, max(y - 10, 15)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        if not part_detected:
+            self.status_badge.setText("WAITING FOR PRODUCT (part_a)")
+            self.status_badge.setStyleSheet("background-color: #334155; color: #94a3b8; padding: 15px; border-radius: 8px;")
+            current_state = "WAITING"
+        elif has_defect:
+            defect_names = ", ".join(list(set([d['label'] for d in defects])))
+            self.status_badge.setText(f"REJECT (NG) - {defect_names}")
+            self.status_badge.setStyleSheet("background-color: #7f1d1d; color: #fca5a5; padding: 15px; border-radius: 8px;")
+            current_state = "REJECT"
+        else:
+            self.status_badge.setText("STATUS: PASS (OK)")
+            self.status_badge.setStyleSheet("background-color: #14532d; color: #86efac; padding: 15px; border-radius: 8px;")
+            current_state = "PASS"
+
+        if current_state != self.last_state and current_state in ["PASS", "REJECT"]:
+            self.total_scanned += 1
+            if current_state == "PASS":
+                self.pass_count += 1
+                self.add_log_record("PASS (OK)", "No Defect Detected")
+            elif current_state == "REJECT":
+                self.defect_count += 1
+                defect_names = ", ".join(list(set([d['label'] for d in defects])))
+                self.add_log_record("REJECT (NG)", defect_names)
+            
+            self.update_kpi_cards()
+
+        self.last_state = current_state
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_frame.shape
+        bytes_per_line = ch * w
+        q_img = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        self.video_label.setPixmap(QPixmap.fromImage(q_img).scaled(
+            self.video_label.width(), self.video_label.height(), Qt.AspectRatioMode.KeepAspectRatio
+        ))
+
+    def on_detections_ready(self, detections):
+        self.latest_detections = detections
+
+    def add_log_record(self, status, defects):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        part_id = f"PART_A_{self.part_counter:04d}"
+        self.part_counter += 1
+
+        row_position = 0
+        self.table.insertRow(row_position)
+        self.table.setItem(row_position, 0, QTableWidgetItem(timestamp))
+        self.table.setItem(row_position, 1, QTableWidgetItem(part_id))
+        
+        status_item = QTableWidgetItem(status)
+        status_item.setForeground(Qt.GlobalColor.red if "NG" in status else Qt.GlobalColor.green)
+        self.table.setItem(row_position, 2, status_item)
+        
+        self.table.setItem(row_position, 3, QTableWidgetItem(defects))
+
+    def update_kpi_cards(self):
+        self.card_total.val_label.setText(str(self.total_scanned))
+        self.card_pass.val_label.setText(str(self.pass_count))
+        self.card_defect.val_label.setText(str(self.defect_count))
+        
+        if self.total_scanned > 0:
+            yield_rate = (self.pass_count / self.total_scanned) * 100
+            self.card_yield.val_label.setText(f"{yield_rate:.1f}%")
+
+    def closeEvent(self, event):
+        self.camera_thread.stop()
+        self.infer_thread.stop()
+        event.accept()
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
